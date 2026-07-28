@@ -261,11 +261,12 @@ jobs:
     needs: [setup, before]
     if: ${{ needs.setup.outputs.scenario == 'errored' }}
     runs-on: ubuntu-latest
-    # pages:write so the gate can attempt its one rebuild (and still fail), and so
-    # the restore step can force the fixture back to a built site.
+    # pages:READ only, exactly what `screencomp init` scaffolds. So when the gate
+    # meets an errored build its one rebuild is denied, and it must still fail the
+    # job rather than shrug — the "passes silently" regression, inverted.
     permissions:
       contents: write
-      pages: write
+      pages: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -290,6 +291,30 @@ jobs:
           git commit -qm "e2e: force a failing Pages build"
           git push -q origin gh-pages
 
+      # Wait for the broken build OUTSIDE the gate and assert it really errored,
+      # so the next step is unambiguously testing the errored branch. A failing
+      # Jekyll build can sit in `building` for well over ten minutes.
+      - name: Confirm GitHub really errored the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_BUILD: ${{ needs.before.outputs.build }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 150); do
+            id="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.url')"
+            id="${id##*/}"
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.status')"
+            if [ "$id" != "$PREVIOUS_BUILD" ]; then
+              case "$status" in queued | building) ;; *) break ;; esac
+            fi
+            sleep 10
+          done
+          echo "build ${id} settled as '${status}'"
+          [ "$status" = errored ] || {
+            echo "::error::wanted a genuinely errored build, got '${status}'" >&2
+            exit 1
+          }
+
       - name: The gate must fail loudly
         id: gate
         continue-on-error: true
@@ -297,9 +322,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PREVIOUS_BUILD: ${{ needs.before.outputs.build }}
-          POLL_SECONDS: "10"
-          APPEAR_ATTEMPTS: "18"
-          SETTLE_ATTEMPTS: "60"
+          POLL_SECONDS: "5"
+          APPEAR_ATTEMPTS: "6"
+          SETTLE_ATTEMPTS: "6"
         run: bash scripts/visual-docs-pages-build.sh verify
 
       - name: Assert it failed
@@ -313,7 +338,8 @@ jobs:
           echo "the gate failed the run on a genuinely errored Pages build"
 
       # Always put the fixture back to a buildable state, or every later run
-      # starts from a broken site.
+      # starts from a broken site. The push itself triggers the rebuild, so this
+      # needs no pages:write.
       - name: Restore the published site
         if: always()
         env:
@@ -330,10 +356,12 @@ jobs:
           git add -A
           git commit -qm "e2e: restore a buildable Pages site"
           git push -q origin gh-pages
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
-          for _ in $(seq 1 40); do
+          for _ in $(seq 1 150); do
             status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
-            [ "$status" = building ] || [ "$status" = queued ] || break
-            sleep 10
+            case "$status" in queued | building) sleep 10 ;; *) break ;; esac
           done
-          echo "restored; pages status: $(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
+          echo "restored; pages status: ${status}"
+          [ "$status" = built ] || {
+            echo "::error::the fixture was left in '${status}'" >&2
+            exit 1
+          }
