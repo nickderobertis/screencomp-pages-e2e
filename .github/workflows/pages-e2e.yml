@@ -134,6 +134,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pages: read # read the build this lane's own deploy triggers
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -176,6 +177,32 @@ jobs:
           publish: true
           pages-artifact: ${{ needs.setup.outputs.artifact == 'yes' && format('screencomp-gallery-{0}-x86_64', matrix.project) || '' }}
           github-token: ${{ github.token }}
+
+      # The direct per-lane deploy must not return while the build its push
+      # started is still in flight — the original defect, on the path the
+      # coalesced deploy does not take. Asserted HERE, inside the lane and
+      # immediately after the action, so there is no window in which a healthy
+      # build could have finished on its own and made an ungated action look
+      # gated. Before the gate this read was 'queued' or 'building' every time.
+      - name: The lane did not return before its Pages build settled
+        if: ${{ needs.setup.outputs.artifact == 'no' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_BUILD: ${{ needs.before.outputs.build }}
+        run: |
+          set -euo pipefail
+          id="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.url')"
+          id="${id##*/}"
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.status')"
+          echo "build ${id} (previous ${PREVIOUS_BUILD}) is '${status}'"
+          [ "$id" != "$PREVIOUS_BUILD" ] || {
+            echo "::error::the direct deploy started no new Pages build" >&2
+            exit 1
+          }
+          [ "$status" = built ] || {
+            echo "::error::the lane returned with its Pages build '${status}'" >&2
+            exit 1
+          }
 
   deploy-pages:
     needs: [setup, report]
@@ -239,9 +266,10 @@ jobs:
           done
           cat digest.txt
 
-          # The coalesced path has already waited; the pre-change per-lane path has
-          # not, so poll here rather than assuming either. What matters is that the
-          # site ends up built, and that only the coalesced path guarantees when.
+          # Both paths gate on their own build now, so this should be settled
+          # already. Poll anyway: this job asserts the site's END state, and a
+          # prune or another repository writing the same gallery can restart a
+          # build between the gate passing and this read.
           for _ in $(seq 1 40); do
             status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
             case "$status" in queued | building) sleep 10 ;; *) break ;; esac
