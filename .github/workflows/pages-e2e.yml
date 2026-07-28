@@ -88,21 +88,37 @@ jobs:
     # pages:read so the recorded build id is real; without it the gate would treat
     # the already-published build as new and the errored scenario would prove nothing.
     permissions:
-      contents: read
+      contents: write
       pages: read
     outputs:
       commits: ${{ steps.snap.outputs.commits }}
       build: ${{ steps.snap.outputs.build }}
     steps:
+      # Clear the lanes this run publishes BEFORE snapshotting. peaceiris commits
+      # nothing when the published bytes are unchanged, so without this a re-run
+      # would add 0 commits and the count would prove nothing about coalescing.
       - id: snap
         env:
           GH_TOKEN: ${{ github.token }}
+          LANES: ${{ needs.setup.outputs.lanes }}
         run: |
           set -euo pipefail
           commits=0
           if git clone --quiet --branch gh-pages \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" snap 2>/dev/null; then
-            commits="$(git -C snap rev-list --count HEAD)"
+            cd snap
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            for project in $(jq -r '.[].project' <<<"$LANES"); do
+              rm -rf "$project"
+            done
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A
+              git commit -qm "e2e: clear the lanes this run republishes"
+              git push -q origin gh-pages
+            fi
+            commits="$(git rev-list --count HEAD)"
+            cd ..
           fi
           build="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.url' 2>/dev/null || true)"
           {
@@ -212,9 +228,15 @@ jobs:
 
           # Record the published tree so the two single-project scenarios can be
           # compared byte for byte.
-          (cd site && git ls-tree -r --name-only HEAD | grep -v '^\.nojekyll$' | sort) >tree.txt
-          (cd site && for f in $(git ls-tree -r --name-only HEAD | grep -v '^\.nojekyll$' | sort); do
-             printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done) >digest.txt
+          # Only this scenario's lanes: keep_files leaves other scenarios' output
+          # in place, and it is not what this run published.
+          : >tree.txt; : >digest.txt
+          for path in $expect; do
+            lane="${path%%/*}"
+            (cd site && find "$lane" -type f | sort) >>tree.txt
+            (cd site && for f in $(find "$lane" -type f | sort); do
+               printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done) >>digest.txt
+          done
           cat digest.txt
 
           status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
