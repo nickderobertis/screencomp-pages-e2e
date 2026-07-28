@@ -300,7 +300,7 @@ jobs:
           PREVIOUS_BUILD: ${{ needs.before.outputs.build }}
         run: |
           set -euo pipefail
-          for _ in $(seq 1 150); do
+          for _ in $(seq 1 300); do
             id="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.url')"
             id="${id##*/}"
             status="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.status')"
@@ -322,7 +322,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PREVIOUS_BUILD: ${{ needs.before.outputs.build }}
-          POLL_SECONDS: "5"
+          # The build has already settled as errored above, so the gate sees it
+          # on its first poll; these only bound a surprise.
+          POLL_SECONDS: "10"
           APPEAR_ATTEMPTS: "6"
           SETTLE_ATTEMPTS: "6"
         run: bash scripts/visual-docs-pages-build.sh verify
@@ -356,7 +358,7 @@ jobs:
           git add -A
           git commit -qm "e2e: restore a buildable Pages site"
           git push -q origin gh-pages
-          for _ in $(seq 1 150); do
+          for _ in $(seq 1 300); do
             status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
             case "$status" in queued | building) sleep 10 ;; *) break ;; esac
           done
