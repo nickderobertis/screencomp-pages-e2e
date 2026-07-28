@@ -1,0 +1,311 @@
+# End-to-end proof of screencomp's coalesced multi-project Pages deploy.
+#
+# The offline Rust suite can execute the shipped shell and stub the GitHub API,
+# but it cannot execute a composite action, the artifact hand-off between jobs,
+# the peaceiris push, or a real GitHub Pages build. This workflow does all four
+# against this repository's own Pages site.
+#
+# It mirrors the reusable workflow's job graph rather than calling it: the
+# reusable workflow pins its composite actions to the floating `@v0` tag, which a
+# brand-new action does not exist under until it ships, so a pre-release self-test
+# has to reference the actions by the ref under test. `screencomp-ref.txt` is that
+# ref; `scenario.txt` picks the proof.
+name: Pages coalesce e2e
+
+on:
+  push:
+    branches: [main]
+
+# Deploying to this repo's own gh-pages with the built-in token is the
+# `pages-repository: ''` path, so every run is also that path's regression proof.
+permissions:
+  contents: read
+
+# Pages builds are per-repository, so two runs must never overlap — that is the
+# very race under test.
+concurrency:
+  group: pages-e2e
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      scenario: ${{ steps.read.outputs.scenario }}
+      ref: ${{ steps.read.outputs.ref }}
+      lanes: ${{ steps.read.outputs.lanes }}
+      artifact: ${{ steps.read.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          set -euo pipefail
+          scenario="$(tr -d '[:space:]' <scenario.txt)"
+          ref="$(tr -d '[:space:]' <screencomp-ref.txt)"
+          case "$scenario" in
+            multi)  lanes='[{"project":"alpha"},{"project":"beta"}]'; artifact=yes ;;
+            single-direct)    lanes='[{"project":"alpha"}]'; artifact=no  ;;
+            single-coalesced) lanes='[{"project":"alpha"}]'; artifact=yes ;;
+            errored) lanes='[]'; artifact=no ;;
+            *) echo "::error::unknown scenario '$scenario'" >&2; exit 1 ;;
+          esac
+          {
+            echo "scenario=$scenario"
+            echo "ref=$ref"
+            echo "lanes=$lanes"
+            echo "artifact=$artifact"
+          } >>"$GITHUB_OUTPUT"
+          echo "scenario=$scenario ref=$ref lanes=$lanes artifact=$artifact"
+
+  # Build the CLI from the ref under test once and share it, so each report lane
+  # is the composite action's runtime rather than another cargo build.
+  cli:
+    needs: setup
+    if: ${{ needs.setup.outputs.scenario != 'errored' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: nickderobertis/screencomp
+          ref: ${{ needs.setup.outputs.ref }}
+      - run: rustup toolchain install 1.89.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+        env:
+          RUSTUP_TOOLCHAIN: "1.89.0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screencomp-cli
+          path: target/release/screencomp
+          if-no-files-found: error
+          retention-days: 1
+
+  # Record the gallery branch's state before anything is pushed, so the run can
+  # prove how many commits it actually added.
+  before:
+    needs: setup
+    runs-on: ubuntu-latest
+    # pages:read so the recorded build id is real; without it the gate would treat
+    # the already-published build as new and the errored scenario would prove nothing.
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      commits: ${{ steps.snap.outputs.commits }}
+      build: ${{ steps.snap.outputs.build }}
+    steps:
+      - id: snap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          commits=0
+          if git clone --quiet --branch gh-pages \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" snap 2>/dev/null; then
+            commits="$(git -C snap rev-list --count HEAD)"
+          fi
+          build="$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" --jq '.url' 2>/dev/null || true)"
+          {
+            echo "commits=$commits"
+            echo "build=${build##*/}"
+          } >>"$GITHUB_OUTPUT"
+          echo "gh-pages commits before: $commits; latest build: ${build##*/}"
+
+  # The reusable workflow's report lane, serialized the same way.
+  report:
+    needs: [setup, cli, before]
+    if: ${{ needs.setup.outputs.scenario != 'errored' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.lanes) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: screencomp-cli
+          path: bin
+      - run: |
+          set -euo pipefail
+          chmod +x bin/screencomp
+          echo "$PWD/bin" >>"$GITHUB_PATH"
+
+      # A deterministic, browser-free capture in the layout the action expects.
+      - name: Fake capture
+        env:
+          PROJECT: ${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          dir="shots/current/${PROJECT}/x86_64"
+          mkdir -p "$dir"
+          printf 'shot-%s' "$PROJECT" >"$dir/home.png"
+          hash="$(printf 'shot-%s' "$PROJECT" | sha256sum | cut -d' ' -f1)"
+          cat >"$dir/captures.json" <<JSON
+          {"schema":1,"shots":[{"name":"home","toggles":{"viewport":"desktop"},"hash":"${hash}","image":"home.png"}]}
+          JSON
+
+      # The action under test. `pages-artifact` empty is the pre-change per-lane
+      # deploy; set, it is the coalesced hand-off.
+      - uses: nickderobertis/screencomp/visual-docs@ai-orchestrator/engineer/fc84a543-07330bec5b
+        with:
+          project: ${{ matrix.project }}
+          arch: x86_64
+          current: shots/current/${{ matrix.project }}
+          gallery-title: ${{ matrix.project }}
+          pages: true
+          publish: true
+          pages-artifact: ${{ needs.setup.outputs.artifact == 'yes' && format('screencomp-gallery-{0}-x86_64', matrix.project) || '' }}
+          github-token: ${{ github.token }}
+
+  deploy-pages:
+    needs: [setup, report]
+    if: ${{ !cancelled() && needs.setup.outputs.artifact == 'yes' && needs.report.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    # Exactly what `screencomp init` scaffolds, so the happy path is proven on the
+    # permissions a real caller has: no pages:write, so no rebuild is available.
+    permissions:
+      contents: write
+      pages: read
+    steps:
+      - uses: nickderobertis/screencomp/visual-docs-pages@ai-orchestrator/engineer/fc84a543-07330bec5b
+        with:
+          github-token: ${{ github.token }}
+
+  # Everything above is the product; this is the proof.
+  assert:
+    needs: [setup, before, report, deploy-pages]
+    if: ${{ !cancelled() && needs.setup.outputs.scenario != 'errored' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - name: One commit, every gallery published, Pages built
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCENARIO: ${{ needs.setup.outputs.scenario }}
+          BEFORE_COMMITS: ${{ needs.before.outputs.commits }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --branch gh-pages \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" site
+          after="$(git -C site rev-list --count HEAD)"
+          added=$((after - BEFORE_COMMITS))
+          echo "gh-pages commits: ${BEFORE_COMMITS} -> ${after} (added ${added})"
+          if [ "$added" -ne 1 ]; then
+            echo "::error::expected exactly 1 gh-pages commit for this run, got ${added}" >&2
+            exit 1
+          fi
+
+          case "$SCENARIO" in
+            multi) expect="alpha/x86_64/index.html beta/x86_64/index.html" ;;
+            *)     expect="alpha/x86_64/index.html" ;;
+          esac
+          for path in $expect; do
+            [ -f "site/$path" ] || { echo "::error::missing $path on gh-pages" >&2; exit 1; }
+            echo "published $path"
+          done
+
+          # Record the published tree so the two single-project scenarios can be
+          # compared byte for byte.
+          (cd site && git ls-tree -r --name-only HEAD | grep -v '^\.nojekyll$' | sort) >tree.txt
+          (cd site && for f in $(git ls-tree -r --name-only HEAD | grep -v '^\.nojekyll$' | sort); do
+             printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done) >digest.txt
+          cat digest.txt
+
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
+          echo "pages status: ${status}"
+          [ "$status" = built ] || { echo "::error::Pages site is '${status}', not built" >&2; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-tree-${{ needs.setup.outputs.scenario }}
+          path: |
+            tree.txt
+            digest.txt
+
+  # The failure half: force a Pages build that genuinely errors and prove the
+  # shipped gate fails the job instead of passing silently.
+  errored:
+    needs: [setup, before]
+    if: ${{ needs.setup.outputs.scenario == 'errored' }}
+    runs-on: ubuntu-latest
+    # pages:write so the gate can attempt its one rebuild (and still fail), and so
+    # the restore step can force the fixture back to a built site.
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: nickderobertis/screencomp
+          ref: ${{ needs.setup.outputs.ref }}
+
+      # Legacy Pages runs Jekyll unless .nojekyll is present, and Jekyll fails on
+      # a malformed _config.yml — a real errored build, from real content.
+      - name: Break the published site
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch gh-pages \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" broken
+          cd broken
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -f .nojekyll
+          printf 'plugins:\n  - : [\n' >_config.yml
+          git add -A
+          git commit -qm "e2e: force a failing Pages build"
+          git push -q origin gh-pages
+
+      - name: The gate must fail loudly
+        id: gate
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PREVIOUS_BUILD: ${{ needs.before.outputs.build }}
+          POLL_SECONDS: "10"
+          APPEAR_ATTEMPTS: "18"
+          SETTLE_ATTEMPTS: "60"
+        run: bash scripts/visual-docs-pages-build.sh verify
+
+      - name: Assert it failed
+        run: |
+          set -euo pipefail
+          echo "gate outcome: ${{ steps.gate.outcome }}"
+          [ "${{ steps.gate.outcome }}" = failure ] || {
+            echo "::error::the gate passed on an errored Pages build" >&2
+            exit 1
+          }
+          echo "the gate failed the run on a genuinely errored Pages build"
+
+      # Always put the fixture back to a buildable state, or every later run
+      # starts from a broken site.
+      - name: Restore the published site
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch gh-pages \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" fixed
+          cd fixed
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -f _config.yml
+          : >.nojekyll
+          git add -A
+          git commit -qm "e2e: restore a buildable Pages site"
+          git push -q origin gh-pages
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/pages/builds" >/dev/null
+          for _ in $(seq 1 40); do
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
+            [ "$status" = building ] || [ "$status" = queued ] || break
+            sleep 10
+          done
+          echo "restored; pages status: $(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
