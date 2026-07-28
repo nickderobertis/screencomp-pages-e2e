@@ -239,7 +239,13 @@ jobs:
           done
           cat digest.txt
 
-          status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
+          # The coalesced path has already waited; the pre-change per-lane path has
+          # not, so poll here rather than assuming either. What matters is that the
+          # site ends up built, and that only the coalesced path guarantees when.
+          for _ in $(seq 1 40); do
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.status')"
+            case "$status" in queued | building) sleep 10 ;; *) break ;; esac
+          done
           echo "pages status: ${status}"
           [ "$status" = built ] || { echo "::error::Pages site is '${status}', not built" >&2; exit 1; }
       - uses: actions/upload-artifact@v4
